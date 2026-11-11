@@ -2,7 +2,8 @@ import { Request, Response } from 'express';
 import logger from '../logger';
 import { extractMessages, WebhookPayload } from './messageExtractor';
 import { checkIdempotency, storeIdempotencyEntry } from '../services/idempotencyService';
-import { enqueueMessage } from '../services/messageEnqueuer';
+import { storeMessage } from '../services/messageStore';
+import { addMessageToBurst, BurstMessage } from '../services/burstAggregator';
 
 export function handleWebhookGet(req: Request, res: Response): void {
   const mode = req.query['hub.mode'] as string;
@@ -61,7 +62,7 @@ export async function handleWebhookPost(req: Request, res: Response): Promise<vo
         from: messages.map((m) => m.from),
       });
 
-      // Process each message through idempotency check and queue
+      // Process each message through idempotency check and burst aggregation
       for (const message of messages) {
         try {
           const messageId = message.id;
@@ -75,14 +76,24 @@ export async function handleWebhookPost(req: Request, res: Response): Promise<vo
             continue;
           }
 
-          // Enqueue message for processing
-          await enqueueMessage({
-            messageId,
-            payload: message,
-            sender: message.from,
-            timestamp: new Date().toISOString(),
-            webhookReceivedAt: new Date().toISOString(),
-          });
+          // Store message metadata and webhook request
+          const isNew = await storeMessage(messageId, message.from, message, new Date());
+
+          // Buffer the message so a burst from the same sender is answered once (RF-02).
+          // A row that already existed is a concurrent redelivery: it is already buffered.
+          if (isNew) {
+            const burstMessage: BurstMessage = {
+              id: messageId,
+              from: message.from,
+              timestamp: message.timestamp,
+              type: message.type,
+              text: message.text,
+              mediaId: message.mediaId,
+              payload: message,
+            };
+
+            await addMessageToBurst(message.from, burstMessage);
+          }
 
           // Store idempotency entry with the successful response
           await storeIdempotencyEntry(messageId, { received: true });

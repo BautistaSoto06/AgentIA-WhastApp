@@ -7,7 +7,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "ts-node src/index.ts",
-    "worker": "ts-node src/queue/worker.ts",
+    "worker": "ts-node src/queue/burstWorker.ts",
     "migrate": "node scripts/migrate.js",
     "test": "jest",
     "test:integration": "jest --testPathPattern=integration",

@@ -3,10 +3,11 @@ import http from 'http';
 import { createApp } from '../src/app';
 import { checkIdempotency, storeIdempotencyEntry, cleanupExpiredEntries } from '../src/services/idempotencyService';
 import { initializeDatabase, closeDatabase, getPool } from '../src/database';
-import { initializeRedis, closeRedis } from '../src/redis';
-import { initializeMessageQueue, enqueueMessage, closeMessageQueue, getMessageQueue } from '../src/services/messageEnqueuer';
+import { initializeRedis, closeRedis, getRedisClient } from '../src/redis';
+import { storeMessage } from '../src/services/messageStore';
+import { initializeBurstQueue, closeBurstQueue, getBurstQueue, addMessageToBurst } from '../src/services/burstAggregator';
 
-describe('Idempotency & Queue Integration Tests', () => {
+describe('Idempotency & Message Store Integration Tests', () => {
   jest.setTimeout(15000);
 
   // Setup and teardown
@@ -18,11 +19,11 @@ describe('Idempotency & Queue Integration Tests', () => {
 
     await initializeDatabase();
     await initializeRedis();
-    initializeMessageQueue(process.env.REDIS_URL);
+    initializeBurstQueue(process.env.REDIS_URL);
   });
 
   afterAll(async () => {
-    await closeMessageQueue();
+    await closeBurstQueue();
     await closeDatabase();
     await closeRedis();
   });
@@ -137,18 +138,12 @@ describe('Idempotency & Queue Integration Tests', () => {
     });
   });
 
-  describe('Message Enqueuer Service', () => {
-    it('should enqueue message successfully', async () => {
+  describe('Message Store Service', () => {
+    it('should store a new message as pending', async () => {
       const messageId = 'msg_' + Date.now();
-      const job = await enqueueMessage({
-        messageId,
-        payload: { test: 'data' },
-        sender: '1234567890',
-        timestamp: new Date().toISOString(),
-        webhookReceivedAt: new Date().toISOString(),
-      });
+      const isNew = await storeMessage(messageId, '1234567890', { test: 'data' }, new Date());
 
-      expect(job.id).toBeDefined();
+      expect(isNew).toBe(true);
 
       // Verify message stored in database
       const pool = getPool();
@@ -163,42 +158,24 @@ describe('Idempotency & Queue Integration Tests', () => {
 
     it('should store webhook request log', async () => {
       const messageId = 'msg_' + Date.now();
-      await enqueueMessage({
-        messageId,
-        payload: { test: 'data' },
-        sender: '1234567890',
-        timestamp: new Date().toISOString(),
-        webhookReceivedAt: new Date().toISOString(),
-      });
+      await storeMessage(messageId, '1234567890', { test: 'data' }, new Date());
 
       const pool = getPool();
       const result = await pool.query(
         'SELECT * FROM webhook_requests WHERE message_id = $1',
         [messageId]
       );
-      expect(result.rows.length).toBeGreaterThan(0);
+      expect(result.rows.length).toBe(1);
     });
 
     it('should handle duplicate message IDs gracefully', async () => {
       const messageId = 'msg_' + Date.now();
       const payload = { test: 'data' };
 
-      await enqueueMessage({
-        messageId,
-        payload,
-        sender: '1234567890',
-        timestamp: new Date().toISOString(),
-        webhookReceivedAt: new Date().toISOString(),
-      });
+      expect(await storeMessage(messageId, '1234567890', payload, new Date())).toBe(true);
 
-      // Try to enqueue same message ID again
-      await enqueueMessage({
-        messageId,
-        payload,
-        sender: '1234567890',
-        timestamp: new Date().toISOString(),
-        webhookReceivedAt: new Date().toISOString(),
-      });
+      // Storing the same message ID again reports it as not new
+      expect(await storeMessage(messageId, '1234567890', payload, new Date())).toBe(false);
 
       const pool = getPool();
       const result = await pool.query(
@@ -290,47 +267,36 @@ describe('Idempotency & Queue Integration Tests', () => {
     });
   });
 
-  describe('Queue Persistence', () => {
-    it('should persist messages reliably in queue', async () => {
-      const messageId = 'msg_' + Date.now();
-      const jobData = {
-        messageId,
-        payload: { test: 'data' },
-        sender: '1234567890',
-        timestamp: new Date().toISOString(),
-        webhookReceivedAt: new Date().toISOString(),
-      };
+  describe('Burst Queue Persistence', () => {
+    const sender = 'persist_' + Date.now();
+    const message = (id: string) => ({ id, from: sender, timestamp: '1700000000', type: 'text', text: id, payload: {} });
 
-      const job = await enqueueMessage(jobData);
-      expect(job.id).toBeDefined();
-
-      // Retrieve job from queue
-      const queue = getMessageQueue();
-      const retrievedJob = await queue.getJob(job.id);
-
-      expect(retrievedJob).toBeDefined();
-      expect(retrievedJob?.data.messageId).toBe(messageId);
+    afterEach(async () => {
+      await getBurstQueue().empty();
+      await getRedisClient().del([`burst:${sender}`, `burst:seq:${sender}`, `burst:time:${sender}`]);
     });
 
-    it('should handle queue with multiple messages', async () => {
-      const queue = getMessageQueue();
-      const messageIds = [];
+    it('should persist a delayed job and the buffered message in Redis', async () => {
+      const messageId = 'msg_' + Date.now();
+      await addMessageToBurst(sender, message(messageId));
 
-      for (let i = 0; i < 3; i++) {
-        const messageId = 'msg_' + Date.now() + i;
-        messageIds.push(messageId);
+      const delayed = (await getBurstQueue().getDelayed()).filter((j) => j.data.sender === sender);
+      expect(delayed).toHaveLength(1);
 
-        await enqueueMessage({
-          messageId,
-          payload: { index: i },
-          sender: '1234567890',
-          timestamp: new Date().toISOString(),
-          webhookReceivedAt: new Date().toISOString(),
-        });
+      const buffered = await getRedisClient().lRange(`burst:${sender}`, 0, -1);
+      expect(buffered.map((m) => JSON.parse(m).id)).toEqual([messageId]);
+    });
+
+    it('should buffer multiple messages in arrival order', async () => {
+      const messageIds = [0, 1, 2].map((i) => 'msg_' + Date.now() + i);
+
+      for (const messageId of messageIds) {
+        await addMessageToBurst(sender, message(messageId));
       }
 
-      const count = await queue.getJobCounts();
-      expect(count.waiting).toBeGreaterThanOrEqual(3);
+      const buffered = await getRedisClient().lRange(`burst:${sender}`, 0, -1);
+      expect(buffered.map((m) => JSON.parse(m).id)).toEqual(messageIds);
+      expect(await getRedisClient().get(`burst:seq:${sender}`)).toBe('3');
     });
   });
 

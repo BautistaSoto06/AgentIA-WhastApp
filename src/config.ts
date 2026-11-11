@@ -21,4 +21,12 @@ export const config = {
   logging: {
     level: process.env.LOG_LEVEL || 'info',
   },
+
+  // Burst config uses getter to support tests that set env vars after module load
+  get burst() {
+    return {
+      windowMs: parseInt(process.env.BURST_WINDOW_MS || '10000', 10),
+      maxWaitMs: parseInt(process.env.BURST_MAX_WAIT_MS || '30000', 10),
+    };
+  },
 };

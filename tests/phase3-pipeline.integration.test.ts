@@ -6,7 +6,7 @@ import { spawn, spawnSync, ChildProcess } from 'child_process';
 import { createApp } from '../src/app';
 import { initializeDatabase, closeDatabase, getPool } from '../src/database';
 import { initializeRedis, closeRedis, getRedisClient } from '../src/redis';
-import { initializeMessageQueue, closeMessageQueue, getMessageQueue } from '../src/services/messageEnqueuer';
+import { initializeBurstQueue, closeBurstQueue, getBurstQueue } from '../src/services/burstAggregator';
 import * as redisModule from '../src/redis';
 import { checkIdempotency, storeIdempotencyEntry } from '../src/services/idempotencyService';
 
@@ -90,9 +90,11 @@ describe('Phase 3 - Idempotent pipeline', () => {
   beforeAll(async () => {
     process.env.WHATSAPP_APP_SECRET = SECRET;
     process.env.WHATSAPP_VERIFY_TOKEN = 'test_verify_token';
+    process.env.BURST_WINDOW_MS = '500';
+    process.env.BURST_MAX_WAIT_MS = '2000';
     await initializeDatabase();
     await initializeRedis();
-    initializeMessageQueue(process.env.REDIS_URL || 'redis://localhost:6379');
+    initializeBurstQueue(process.env.REDIS_URL || 'redis://localhost:6379');
     await new Promise<void>((resolve) => {
       server = createApp().listen(0, () => resolve());
     });
@@ -100,21 +102,31 @@ describe('Phase 3 - Idempotent pipeline', () => {
 
   afterAll(async () => {
     await new Promise<void>((resolve) => server.close(() => resolve()));
-    await closeMessageQueue();
+    await closeBurstQueue();
     await closeDatabase();
     await closeRedis();
   });
 
   beforeEach(async () => {
     const pool = getPool();
+    await pool.query('DELETE FROM message_bursts');
     await pool.query('DELETE FROM message_deduplication');
     await pool.query('DELETE FROM webhook_requests');
     await pool.query('DELETE FROM messages');
-    await getMessageQueue().empty();
+    await clearBursts();
   });
 
+  // Drop pending burst jobs and buffers so each test starts with no buffered messages
+  async function clearBursts(): Promise<void> {
+    await getBurstQueue().empty();
+    const keys = await getRedisClient().keys('burst:*');
+    if (keys.length > 0) {
+      await getRedisClient().del(keys);
+    }
+  }
+
   describe('Webhook end to end', () => {
-    it('persists the message, audit log, dedup entry, Redis key and queue job', async () => {
+    it('persists the message, audit log, dedup entry, Redis key and burst', async () => {
       const id = 'wamid.e2e_' + Date.now();
       expect(await postWebhook(server, textPayload(id, 'quiero un turno'))).toBe(200);
 
@@ -134,12 +146,17 @@ describe('Phase 3 - Idempotent pipeline', () => {
 
       expect(await getRedisClient().ttl(`msg:${id}`)).toBeGreaterThan(24 * 60 * 60 - 60);
 
-      const jobs = await getMessageQueue().getWaiting();
-      expect(jobs.map((j) => j.data.messageId)).toContain(id);
+      // The message waits in the sender's burst buffer with a delayed job (RF-02)
+      const buffered = await getRedisClient().lRange('burst:5491100000000', 0, -1);
+      expect(buffered.map((m) => JSON.parse(m).id)).toEqual([id]);
+      // The 500ms test window may already have moved the job from delayed to waiting
+      const jobs = (await getBurstQueue().getJobs(['delayed', 'waiting'])).filter((j) => j.data.sender === '5491100000000');
+      expect(jobs).toHaveLength(1);
     });
 
-    it('suppresses a duplicate delivery: one message row, one audit row, one job', async () => {
+    it('suppresses a duplicate delivery: one message row, one audit row, one burst', async () => {
       const id = 'wamid.dup_' + Date.now();
+      const sender = '5491100000000';
       expect(await postWebhook(server, textPayload(id))).toBe(200);
       await waitFor(async () => ((await checkIdempotency(id)).isDuplicate ? true : undefined), 5000);
 
@@ -148,8 +165,13 @@ describe('Phase 3 - Idempotent pipeline', () => {
 
       const audit = await getPool().query('SELECT COUNT(*)::int AS n FROM webhook_requests WHERE message_id = $1', [id]);
       expect(audit.rows[0].n).toBe(1);
-      const jobs = (await getMessageQueue().getWaiting()).filter((j) => j.data.messageId === id);
-      expect(jobs).toHaveLength(1);
+
+      const messages = await getPool().query('SELECT COUNT(*)::int AS n FROM messages WHERE message_id = $1', [id]);
+      expect(messages.rows[0].n).toBe(1);
+
+      // The redelivery is not buffered a second time
+      const buffered = await getRedisClient().lRange(`burst:${sender}`, 0, -1);
+      expect(buffered.map((m) => JSON.parse(m).id)).toEqual([id]);
     });
 
     it('enqueues every message of a multi-message webhook', async () => {
@@ -165,7 +187,7 @@ describe('Phase 3 - Idempotent pipeline', () => {
       expect(await postWebhook(server, payload)).toBe(200);
 
       const count = await waitFor(async () => {
-        const r = await getPool().query('SELECT COUNT(*)::int AS n FROM message_deduplication WHERE message_id = ANY($1)', [ids]);
+        const r = await getPool().query('SELECT COUNT(*)::int AS n FROM messages WHERE message_id = ANY($1)', [ids]);
         return r.rows[0].n === 3 ? 3 : undefined;
       }, 5000);
       expect(count).toBe(3);
@@ -201,7 +223,7 @@ describe('Phase 3 - Idempotent pipeline', () => {
     });
   });
 
-  describe('Queue worker', () => {
+  describe('Burst worker', () => {
     let worker: ChildProcess | undefined;
     let workerLog = '';
 
@@ -210,19 +232,19 @@ describe('Phase 3 - Idempotent pipeline', () => {
       worker = undefined;
     });
 
-    it('processes a queued message and marks it completed', async () => {
+    it('processes a burst and marks messages completed', async () => {
       const id = 'wamid.worker_' + Date.now();
       expect(await postWebhook(server, textPayload(id))).toBe(200);
       await waitFor(async () => ((await checkIdempotency(id)).isDuplicate ? true : undefined), 5000);
 
-      worker = spawn(process.execPath, ['-r', 'ts-node/register/transpile-only', 'src/queue/worker.ts'], {
+      worker = spawn(process.execPath, ['-r', 'ts-node/register/transpile-only', 'src/queue/burstWorker.ts'], {
         cwd: ROOT,
-        env: { ...process.env, LOG_LEVEL: 'info' },
+        env: { ...process.env, LOG_LEVEL: 'info', BURST_WINDOW_MS: '500', BURST_MAX_WAIT_MS: '2000' },
       });
       worker.stdout?.on('data', (d) => (workerLog += d));
       worker.stderr?.on('data', (d) => (workerLog += d));
 
-      // The worker fakes 1s of AI work; the job is done once the audit row gets its response.
+      // The worker fakes 1s of AI work; the burst is processed once the audit row gets its response.
       const audit = await waitFor(async () => {
         const r = await getPool().query('SELECT status_code, response_body FROM webhook_requests WHERE message_id = $1', [id]);
         return r.rows[0]?.status_code ? r.rows[0] : undefined;
@@ -230,11 +252,12 @@ describe('Phase 3 - Idempotent pipeline', () => {
 
       if (!audit) {
         // Surface the worker's own error so the failure is actionable.
-        const errors = [...new Set(workerLog.split('\n').filter((l) => /Error processing message/.test(l)).map((l) => l.replace(/^.*?"error":/, '"error":')))];
+        const errors = [...new Set(workerLog.split('\n').filter((l) => /Burst processing failed/.test(l)).map((l) => l.replace(/^.*?"error":/, '"error":')))];
         throw new Error(`audit row never updated; message status is "${await messageStatus(id)}"; worker errors:\n${errors.join('\n')}`);
       }
 
-      expect(audit).toEqual({ status_code: 200, response_body: { processed: true } });
+      expect(audit.status_code).toBe(200);
+      expect(audit.response_body).toHaveProperty('processed', true);
       expect(await messageStatus(id)).toBe('completed');
     });
   });
