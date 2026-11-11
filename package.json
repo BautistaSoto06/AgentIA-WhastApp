@@ -1,0 +1,39 @@
+{
+  "name": "agenteia",
+  "version": "1.0.0",
+  "description": "WhatsApp Cloud API Integration",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "test": "jest",
+    "test:integration": "jest --testPathPattern=integration",
+    "lint": "tsc --noEmit"
+  },
+  "keywords": [],
+  "author": "Bautista Soto",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bull": "^4.14.2",
+    "cors": "^2.8.6",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "helmet": "^8.3.0",
+    "pg": "^8.23.1",
+    "redis": "^6.3.1",
+    "winston": "^3.19.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jest": "^29.5.11",
+    "@types/node": "^20.10.6",
+    "@types/pg": "^8.23.1",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
