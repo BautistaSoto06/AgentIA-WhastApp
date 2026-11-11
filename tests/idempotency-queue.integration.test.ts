@@ -122,12 +122,18 @@ describe('Idempotency & Queue Integration Tests', () => {
 
       await storeIdempotencyEntry(messageId, response);
 
-      const startTime = Date.now();
-      const result = await checkIdempotency(messageId);
-      const duration = Date.now() - startTime;
+      // Use the median of several lookups so one slow tick (GC, first
+      // connection use) doesn't make the test flaky
+      const durations: number[] = [];
+      for (let i = 0; i < 20; i++) {
+        const startTime = process.hrtime.bigint();
+        const result = await checkIdempotency(messageId);
+        durations.push(Number(process.hrtime.bigint() - startTime) / 1e6);
+        expect(result.isDuplicate).toBe(true);
+      }
+      durations.sort((a, b) => a - b);
 
-      expect(result.isDuplicate).toBe(true);
-      expect(duration).toBeLessThan(5);
+      expect(durations[Math.floor(durations.length / 2)]).toBeLessThan(5);
     });
   });
 

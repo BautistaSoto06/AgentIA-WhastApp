@@ -53,7 +53,8 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Create trigger for updated_at
+-- Create trigger for updated_at (dropped first so the migration can be re-run)
+DROP TRIGGER IF EXISTS update_messages_updated_at ON messages;
 CREATE TRIGGER update_messages_updated_at
 BEFORE UPDATE ON messages
 FOR EACH ROW

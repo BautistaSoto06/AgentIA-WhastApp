@@ -2,7 +2,7 @@
   "name": "agenteia",
   "version": "1.0.0",
   "description": "WhatsApp Cloud API Integration",
-  "main": "dist/server.js",
+  "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",

@@ -50,18 +50,8 @@ export function createApp(): Express {
     });
   });
 
+  // Final error handler: logs every error and responds with its status code
   app.use(webhookErrorHandler);
-
-  app.use((err: Error, _req: Request, res: Response) => {
-    logger.error('Unhandled error', {
-      error: err.message,
-      stack: err.stack,
-    });
-
-    res.status(500).json({
-      error: 'Internal Server Error',
-    });
-  });
 
   return app;
 }

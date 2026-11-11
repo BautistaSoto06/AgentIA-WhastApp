@@ -90,10 +90,16 @@ async function processMessage(job: Queue.Job<MessageJobData>): Promise<any> {
       ['completed', messageId]
     );
 
-    // Store webhook response
+    // Store webhook response on the latest request for this message
+    // (PostgreSQL UPDATE has no ORDER BY/LIMIT, so pick the row in a subquery)
     await pool.query(
       `UPDATE webhook_requests SET status_code = $1, response_body = $2
-       WHERE message_id = $3 ORDER BY created_at DESC LIMIT 1`,
+       WHERE id = (
+         SELECT id FROM webhook_requests
+         WHERE message_id = $3
+         ORDER BY created_at DESC, id DESC
+         LIMIT 1
+       )`,
       [200, JSON.stringify({ processed: true }), messageId]
     );
 
