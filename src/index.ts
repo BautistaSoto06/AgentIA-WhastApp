@@ -4,6 +4,7 @@ import logger from './logger';
 import { initializeDatabase, closeDatabase } from './database';
 import { initializeRedis, closeRedis } from './redis';
 import { createApp } from './app';
+import { initializeMessageQueue, closeMessageQueue } from './services/messageEnqueuer';
 
 let server: Server;
 
@@ -13,6 +14,7 @@ async function start(): Promise<void> {
 
     await initializeDatabase();
     await initializeRedis();
+    initializeMessageQueue(config.redis.url);
 
     const app = createApp();
 
@@ -35,6 +37,7 @@ async function gracefulShutdown(signal: string): Promise<void> {
       logger.info('HTTP server closed');
 
       try {
+        await closeMessageQueue();
         await closeDatabase();
         await closeRedis();
         logger.info('Graceful shutdown completed');

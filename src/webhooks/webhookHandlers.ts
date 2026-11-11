@@ -1,6 +1,8 @@
 import { Request, Response } from 'express';
 import logger from '../logger';
 import { extractMessages, WebhookPayload } from './messageExtractor';
+import { checkIdempotency, storeIdempotencyEntry } from '../services/idempotencyService';
+import { enqueueMessage } from '../services/messageEnqueuer';
 
 export function handleWebhookGet(req: Request, res: Response): void {
   const mode = req.query['hub.mode'] as string;
@@ -59,8 +61,38 @@ export async function handleWebhookPost(req: Request, res: Response): Promise<vo
         from: messages.map((m) => m.from),
       });
 
-      // Messages would be processed here (e.g., queued for processing)
-      // For now, just log them
+      // Process each message through idempotency check and queue
+      for (const message of messages) {
+        try {
+          const messageId = message.id;
+          const deduplicationResult = await checkIdempotency(messageId);
+
+          if (deduplicationResult.isDuplicate) {
+            logger.info('Duplicate message received', {
+              messageId,
+              from: message.from,
+            });
+            continue;
+          }
+
+          // Enqueue message for processing
+          await enqueueMessage({
+            messageId,
+            payload: message,
+            sender: message.from,
+            timestamp: new Date().toISOString(),
+            webhookReceivedAt: new Date().toISOString(),
+          });
+
+          // Store idempotency entry with the successful response
+          await storeIdempotencyEntry(messageId, { received: true });
+        } catch (error) {
+          logger.error('Error processing individual message', {
+            error: error instanceof Error ? error.message : String(error),
+            messageId: message.id,
+          });
+        }
+      }
     } else {
       logger.debug('Webhook with no messages', {
         ip: req.ip,

@@ -1,4 +1,5 @@
 export interface WhatsAppMessage {
+  id: string;
   from: string;
   timestamp: string;
   type: 'text' | 'image' | 'document' | 'audio' | 'video' | 'unknown';
@@ -55,6 +56,7 @@ export function extractMessages(payload: WebhookPayload): WhatsAppMessage[] {
 
       for (const msg of messages_list) {
         const message: WhatsAppMessage = {
+          id: msg.id,
           from: msg.from,
           timestamp: msg.timestamp,
           type: 'unknown',
