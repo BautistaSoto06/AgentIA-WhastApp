@@ -1,10 +1,9 @@
 import crypto from 'crypto';
-import { Pool } from 'pg';
 import http from 'http';
 import { createApp } from '../src/app';
 import { checkIdempotency, storeIdempotencyEntry, cleanupExpiredEntries } from '../src/services/idempotencyService';
 import { initializeDatabase, closeDatabase, getPool } from '../src/database';
-import { initializeRedis, closeRedis, getRedisClient } from '../src/redis';
+import { initializeRedis, closeRedis } from '../src/redis';
 import { initializeMessageQueue, enqueueMessage, closeMessageQueue, getMessageQueue } from '../src/services/messageEnqueuer';
 
 describe('Idempotency & Queue Integration Tests', () => {
