@@ -4,22 +4,26 @@ import { getRedisClient } from '../redis';
 import logger from '../logger';
 import { config } from '../config';
 
-// RF-02: messages a sender writes in quick succession are buffered in Redis and
-// processed together once the sender pauses for `burst.windowMs` (or once
-// `burst.maxWaitMs` has passed since the burst's first message).
+// RF-03: Ensure per-client ordering while allowing parallel processing of different clients.
 //
 // Per sender we keep:
 //   burst:<sender>       list of buffered messages, in arrival order
 //   burst:seq:<sender>   monotonic counter, bumped on every message (never reset)
 //   burst:time:<sender>  ms timestamp of the burst's first message
+//   burst:lock:<sender>  lock held while a burst is processing (with TTL)
+//   burst:queue:<sender> queue of burst job ids waiting for this sender
+//
 // Every message schedules a delayed job tagged with its seq and the burst start.
-// When a job fires it only acts if it is still the latest message of the same
-// burst (or the cap was reached), so older jobs become no-ops.
+// When a job fires, TAKE_SCRIPT acquires the lock if available, ensuring only one
+// burst per sender is processed at a time. If lock is held, the job is re-queued.
+// Different senders process in parallel up to the global worker concurrency limit.
 
 export interface BurstJobData {
   sender: string;
   seq: number;
   firstMessageTime: number;
+  lockToken?: string; // Token for per-sender locking
+  lockAttempts?: number; // Count of lock contention retries
 }
 
 export interface BurstMessage {
@@ -32,10 +36,20 @@ export interface BurstMessage {
   payload: any;
 }
 
+// Exception thrown when a burst can't acquire its sender's lock
+export class LockContentionError extends Error {
+  constructor(sender: string, attemptNumber: number) {
+    super(`Lock contention for sender ${sender}, attempt ${attemptNumber}`);
+    this.name = 'LockContentionError';
+  }
+}
+
 const REDIS_BURST_PREFIX = 'burst:';
 const REDIS_SEQ_PREFIX = 'burst:seq:';
 const REDIS_TIME_PREFIX = 'burst:time:';
+const REDIS_LOCK_PREFIX = 'burst:lock:';
 const SEQ_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const LOCK_TTL_MS = 120000; // 2 minutes lock timeout (failsafe)
 
 // KEYS: list, seq, time. ARGV: message json, now, burst key TTL ms, seq TTL ms.
 // Returns { seq, firstMessageTime } for the message just added.
@@ -48,9 +62,11 @@ const ADD_SCRIPT = `
   return { seq, redis.call('GET', KEYS[3]) }
 `;
 
-// KEYS: list, seq, time. ARGV: job seq, job burst start, cap reached (1/0).
-// Returns the buffered messages and clears the burst, or nil when this job
-// belongs to an already processed burst or a newer message is still pending.
+// KEYS: list, seq, time, lock. ARGV: job seq, job burst start, cap reached (1/0), lock TTL ms, lock token.
+// Returns the buffered messages if lock acquired and burst is ready, or nil when:
+// - burst already processed (start mismatch)
+// - newer message pending (unless cap reached)
+// - lock held by another job
 const TAKE_SCRIPT = `
   local start = redis.call('GET', KEYS[3])
   if not start or start ~= ARGV[2] then
@@ -60,9 +76,23 @@ const TAKE_SCRIPT = `
   if current ~= tonumber(ARGV[1]) and ARGV[3] ~= '1' then
     return nil
   end
+  if redis.call('GET', KEYS[4]) then
+    return nil
+  end
+  redis.call('SET', KEYS[4], ARGV[5], 'PX', ARGV[4])
   local messages = redis.call('LRANGE', KEYS[1], 0, -1)
   redis.call('DEL', KEYS[1], KEYS[3])
   return messages
+`;
+
+// KEYS: lock. ARGV: lock token.
+// Release lock only if it matches our token (prevent releasing other's lock).
+const RELEASE_LOCK_SCRIPT = `
+  if redis.call('GET', KEYS[1]) == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+    return 1
+  end
+  return 0
 `;
 
 let burstQueue: Queue.Queue<BurstJobData>;
@@ -72,6 +102,7 @@ function burstKeys(sender: string): string[] {
     `${REDIS_BURST_PREFIX}${sender}`,
     `${REDIS_SEQ_PREFIX}${sender}`,
     `${REDIS_TIME_PREFIX}${sender}`,
+    `${REDIS_LOCK_PREFIX}${sender}`,
   ];
 }
 
@@ -121,8 +152,11 @@ export async function addMessageToBurst(sender: string, message: BurstMessage): 
     const firstMessageTime = parseInt(start, 10);
     const delayMs = Math.max(0, Math.min(windowMs, firstMessageTime + maxWaitMs - now));
 
+    // Generate lock token for this job to track which job holds the sender lock
+    const lockToken = `${sender}-${firstMessageTime}-${seq}-${Math.random().toString(36)}`;
+
     await getBurstQueue().add(
-      { sender, seq, firstMessageTime },
+      { sender, seq, firstMessageTime, lockToken },
       {
         delay: delayMs,
         // Bull silently ignores an add whose jobId already exists, so include the
@@ -139,6 +173,7 @@ export async function addMessageToBurst(sender: string, message: BurstMessage): 
       seq,
       messageId: message.id,
       delayMs,
+      lockToken,
     });
   } catch (error) {
     logger.error('Error adding message to burst', {
@@ -156,18 +191,26 @@ export function combineBurstText(messages: BurstMessage[]): string {
     .join('\n');
 }
 
-// Returns the burst id it processed, or null when the job was a no-op.
+// Returns the burst id it processed, or null when the job was a no-op (superseded).
+// Throws LockContentionError when lock is held by another job.
 export async function processBurst(job: BurstJobData): Promise<number | null> {
-  const { sender, seq, firstMessageTime } = job;
+  const { sender, seq, firstMessageTime, lockToken = '' } = job;
   const capReached = Date.now() - firstMessageTime >= config.burst.maxWaitMs;
 
   const raw = (await getRedisClient().eval(TAKE_SCRIPT, {
     keys: burstKeys(sender),
-    arguments: [String(seq), String(firstMessageTime), capReached ? '1' : '0'],
+    arguments: [String(seq), String(firstMessageTime), capReached ? '1' : '0', String(LOCK_TTL_MS), lockToken],
   })) as string[] | null;
 
-  if (!raw || raw.length === 0) {
-    logger.debug('Burst job superseded, skipping', { sender, seq });
+  if (!raw) {
+    // Lock is held: throw for retry
+    logger.debug('Lock contention, will retry', { sender, seq, lockToken });
+    throw new LockContentionError(sender, 0);
+  }
+
+  if (raw.length === 0) {
+    // Burst was superseded
+    logger.debug('Burst job superseded, skipping', { sender, seq, lockToken });
     return null;
   }
 
@@ -175,6 +218,7 @@ export async function processBurst(job: BurstJobData): Promise<number | null> {
   const messageIds = messages.map((m) => m.id);
   const combinedText = combineBurstText(messages);
   const pool = getPool();
+  const lockKey = `${REDIS_LOCK_PREFIX}${sender}`;
 
   // Record the burst before doing any work so a failure leaves a trace
   const burstResult = await pool.query(
@@ -190,6 +234,7 @@ export async function processBurst(job: BurstJobData): Promise<number | null> {
     burstId,
     messageCount: messages.length,
     waitedMs: Date.now() - firstMessageTime,
+    lockToken,
   });
 
   try {
@@ -235,6 +280,21 @@ export async function processBurst(job: BurstJobData): Promise<number | null> {
     );
     await pool.query(`UPDATE messages SET status = 'failed' WHERE burst_id = $1`, [burstId]);
     throw error;
+  } finally {
+    // Always release lock, even on error
+    try {
+      await getRedisClient().eval(RELEASE_LOCK_SCRIPT, {
+        keys: [lockKey],
+        arguments: [lockToken],
+      });
+      logger.debug('Lock released', { sender, lockToken });
+    } catch (err) {
+      logger.error('Failed to release lock', {
+        error: err instanceof Error ? err.message : String(err),
+        sender,
+        lockToken,
+      });
+    }
   }
 }
 

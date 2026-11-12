@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import logger from '../logger';
 import { initializeDatabase, closeDatabase } from '../database';
 import { initializeRedis, closeRedis } from '../redis';
-import { BurstJobData, initializeBurstQueue, closeBurstQueue, processBurst } from '../services/burstAggregator';
+import { BurstJobData, initializeBurstQueue, closeBurstQueue, processBurst, getBurstQueue, LockContentionError } from '../services/burstAggregator';
 
 dotenv.config();
 
@@ -35,9 +35,57 @@ async function initializeWorker(): Promise<void> {
       });
     });
 
-    // Process jobs with concurrency of 5. Bull's process() promise only settles
-    // when the queue closes, so it is not awaited.
-    queue.process(5, (job) => processBurst(job.data)).catch((error) => {
+    // Process jobs with higher concurrency since ordering is enforced per-sender.
+    // RF-03: Each sender is serialized, different senders process in parallel.
+    // If a job can't acquire the lock (sender is busy), it throws LockContentionError
+    // and is re-queued with exponential backoff.
+    queue.process(20, async (job) => {
+      try {
+        const result = await processBurst(job.data);
+        return result;
+      } catch (error) {
+        // Handle lock contention: re-queue with backoff
+        if (error instanceof LockContentionError) {
+          const attemptNumber = (job.data.lockAttempts || 0) + 1;
+
+          if (attemptNumber <= 3) {
+            // Exponential backoff: 100ms, 200ms, 400ms
+            const delayMs = 100 * Math.pow(2, attemptNumber - 1);
+
+            await getBurstQueue().add(
+              { ...job.data, lockAttempts: attemptNumber },
+              {
+                delay: delayMs,
+                jobId: `${job.id}-retry-${attemptNumber}`,
+                attempts: 1,
+                removeOnComplete: true,
+                removeOnFail: true,
+              }
+            );
+
+            logger.debug('Job re-queued due to lock contention', {
+              jobId: job.id,
+              sender: job.data.sender,
+              delayMs,
+              attempt: attemptNumber,
+            });
+
+            // Return success to not fail the original job
+            return null;
+          } else {
+            logger.warn('Max lock contention retries exceeded', {
+              jobId: job.id,
+              sender: job.data.sender,
+              attempts: attemptNumber,
+            });
+            throw error;
+          }
+        }
+
+        // Other errors should fail the job
+        throw error;
+      }
+    }).catch((error) => {
       logger.error('Burst worker stopped', {
         error: error instanceof Error ? error.message : String(error),
       });
