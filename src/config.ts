@@ -22,6 +22,18 @@ export const config = {
     level: process.env.LOG_LEVEL || 'info',
   },
 
+  // WhatsApp Cloud API outbound config (read lazily so tests can set env after load)
+  get whatsapp() {
+    return {
+      accessToken: process.env.WHATSAPP_ACCESS_TOKEN || '',
+      phoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID || '',
+      apiVersion: process.env.WHATSAPP_API_VERSION || 'v21.0',
+      sendMaxAttempts: parseInt(process.env.WHATSAPP_SEND_MAX_ATTEMPTS || '4', 10),
+      sendBaseDelayMs: parseInt(process.env.WHATSAPP_SEND_BASE_DELAY_MS || '500', 10),
+      windowMs: 24 * 60 * 60 * 1000,
+    };
+  },
+
   // Burst config uses getter to support tests that set env vars after module load
   get burst() {
     return {

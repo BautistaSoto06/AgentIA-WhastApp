@@ -3,6 +3,7 @@ import { getPool } from '../database';
 import { getRedisClient } from '../redis';
 import logger from '../logger';
 import { config } from '../config';
+import { getWhatsAppSender, isOutboundConfigured, OutboundMessage, SendOptions } from './whatsappSender';
 
 // RF-03: Ensure per-client ordering while allowing parallel processing of different clients.
 //
@@ -96,6 +97,19 @@ const RELEASE_LOCK_SCRIPT = `
 `;
 
 let burstQueue: Queue.Queue<BurstJobData>;
+
+// RF-04: produces the reply for a processed burst (the AI step is still a placeholder).
+export type ReplyGenerator = (
+  sender: string,
+  combinedText: string,
+  messages: BurstMessage[]
+) => Promise<{ message: OutboundMessage; options?: SendOptions } | null>;
+
+let replyGenerator: ReplyGenerator | undefined;
+
+export function setReplyGenerator(fn: ReplyGenerator | undefined): void {
+  replyGenerator = fn;
+}
 
 function burstKeys(sender: string): string[] {
   return [
@@ -247,6 +261,21 @@ export async function processBurst(job: BurstJobData): Promise<number | null> {
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
     await pool.query(`UPDATE messages SET status = 'completed' WHERE burst_id = $1`, [burstId]);
+
+    // RF-04: deliver the reply (if a generator is registered and outbound is configured).
+    // A send failure is already recorded by the sender and must not fail the burst.
+    if (replyGenerator && isOutboundConfigured()) {
+      try {
+        const reply = await replyGenerator(sender, combinedText, messages);
+        if (reply) await getWhatsAppSender().send(sender, reply.message, reply.options);
+      } catch (sendErr) {
+        logger.warn('Reply delivery failed', {
+          sender,
+          burstId,
+          error: sendErr instanceof Error ? sendErr.message : String(sendErr),
+        });
+      }
+    }
 
     // Store webhook response on the latest request of each message
     await pool.query(
